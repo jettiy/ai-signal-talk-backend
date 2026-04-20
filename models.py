@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Float, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Text, Float, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -20,13 +20,20 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     nickname = Column(String, nullable=True)
     phone = Column(String, nullable=True)
-    role = Column(SQLEnum(UserRole), default=UserRole.BASIC)
+    role = Column(String, default="BASIC")  # PostgreSQL 호환: SQLEnum 대신 String
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     conversations = relationship("Conversation", back_populates="user")
     messages = relationship("Message", back_populates="user")
+
+    @property
+    def user_role(self) -> UserRole:
+        try:
+            return UserRole(self.role)
+        except (ValueError, TypeError):
+            return UserRole.BASIC
 
 
 class Conversation(Base):

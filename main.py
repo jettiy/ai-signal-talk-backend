@@ -1,84 +1,132 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+"""
+AI Signal Talk Backend v2.1 — 단일 파일 FastAPI 서버
+- Auth: 로그인/회원가입 (JSON body)
+- Z.AI GLM 시그널 분석 연동
+- 대화/메시지 관리
+- SignalHistory
+"""
+import os
+import json
+import re
+from datetime import datetime, timezone
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
-from database import engine, Base, get_db
-from models import User, Conversation, Message, UserRole
+from sqlalchemy import text
+from database import engine, Base, get_db, SessionLocal
+from models import User, Conversation, Message, SignalHistory, UserRole
 from auth import (
     get_password_hash,
     create_access_token,
     verify_password,
     get_current_user,
-    get_current_active_user
+    get_current_active_user,
 )
-from websocket import manager, handle_websocket
-import json
 
-# DB 테이블 생성
-Base.metadata.create_all(bind=engine)
-
-# FastAPI 앱 생성
+# ─── FastAPI 앱 ───
 app = FastAPI(
     title="AI Signal Talk Backend",
     description="트레이딩 커뮤니티 백엔드 API",
-    version="1.0.0"
+    version="2.1.0",
 )
 
-# CORS 설정
+# ─── CORS ───
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ai-signal-talk.vercel.app")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 개발 중에는 모든 origins 허용
+    allow_origins=[FRONTEND_URL, "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ─── Z.AI 설정 ───
+ZAI_API_KEY = os.environ.get("ZAI_API_KEY", "")
+ZAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 
+
+# ─── Startup ───
 @app.on_event("startup")
 async def startup_event():
-    """시작 시 초기화"""
-    # 초기 관리자 계정 생성
-    db = next(get_db())
     try:
-        admin = db.query(User).filter(User.email == "admin@ai-signal-talk.com").first()
-        if not admin:
-            admin = User(
-                email="admin@ai-signal-talk.com",
-                hashed_password=get_password_hash("admin123"),
-                role=UserRole.ADMIN,
-                is_active=1
-            )
-            db.add(admin)
-            db.commit()
-            print("✅ 초기 관리자 계정 생성: admin@ai-signal-talk.com / admin123")
-    finally:
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        try:
+            admin_email = os.environ.get("ADMIN_EMAIL", "admin@ai-signal-talk.com")
+            admin = db.query(User).filter(User.email == admin_email).first()
+            if not admin:
+                admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123!")
+                admin_nick = os.environ.get("ADMIN_NICKNAME", "관리자")
+                admin = User(
+                    email=admin_email,
+                    hashed_password=get_password_hash(admin_pw),
+                    nickname=admin_nick,
+                    role="ADMIN",
+                    is_active=1,
+                )
+                db.add(admin)
+                db.commit()
+                print(f"초기 관리자 계정 생성: {admin_email}")
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"Startup 경고: {e}")
+
+
+# ─── Health ───
+@app.get("/api/health")
+async def health_check():
+    db_ok = False
+    try:
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
         db.close()
+        db_ok = True
+    except Exception:
+        pass
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "version": "2.1.0",
+        "db": db_ok,
+        "auth": True,
+        "websocket": True,
+    }
 
 
 @app.get("/")
 async def root():
-    """홈"""
-    return {
-        "message": "AI Signal Talk Backend API",
-        "version": "1.0.0"
-    }
+    return {"message": "AI Signal Talk Backend API", "version": "2.1.0"}
 
 
-# ===== 로그인 API =====
-@app.post("/api/auth/login")
-async def login(email: str, password: str, db: Session = Depends(get_db)):
-    """로그인"""
+# ═══════════════════════════════════════════
+# Auth API (v2 — JSON body)
+# ═══════════════════════════════════════════
+
+@app.post("/api/v2/auth/login")
+async def v2_login(request: Request, db: Session = Depends(get_db)):
+    """로그인 — JSON { email, password }"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="잘못된 요청 형식")
+
+    email = body.get("email", "").strip()
+    password = body.get("password", "")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="이메일과 비밀번호를 입력하세요.")
+
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="이메일 또는 비밀번호가 올바르지 않습니다."
+            detail="이메일 또는 비밀번호가 올바르지 않습니다.",
         )
-
     if user.is_active != 1:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="비활성 사용자"
-        )
+        raise HTTPException(status_code=403, detail="비활성 사용자")
 
     access_token = create_access_token(data={"sub": str(user.id)})
     return {
@@ -87,143 +135,426 @@ async def login(email: str, password: str, db: Session = Depends(get_db)):
         "user": {
             "id": user.id,
             "email": user.email,
-            "role": user.role.value
-        }
+            "nickname": user.nickname or "",
+            "role": user.user_role.value,
+            "is_pro": user.user_role in (UserRole.PRO, UserRole.ADMIN),
+        },
     }
 
 
-# ===== 사용자 관리 API =====
-@app.post("/api/users/register")
-async def register(
-    email: str,
-    password: str,
-    full_name: str,
-    db: Session = Depends(get_db)
-):
-    """사용자 등록 (관리자 승인 필요)"""
-    # 중복 이메일 확인
+@app.post("/api/v2/auth/register")
+async def v2_register(request: Request, db: Session = Depends(get_db)):
+    """회원가입 — JSON { email, password, nickname }"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="잘못된 요청 형식")
+
+    email = body.get("email", "").strip()
+    password = body.get("password", "")
+    nickname = body.get("nickname", "").strip()
+
+    if not email or not password or not nickname:
+        raise HTTPException(status_code=400, detail="모든 필드를 입력해주세요.")
+    if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email):
+        raise HTTPException(status_code=400, detail="올바른 이메일 형식을 입력해주세요.")
+    if len(password) < 8 or not re.search(r"[a-zA-Z]", password) or not re.search(r"[0-9]", password):
+        raise HTTPException(status_code=400, detail="비밀번호는 영문+숫자 8자 이상이어야 합니다.")
+
     existing = db.query(User).filter(User.email == email).first()
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="이미 등록된 이메일입니다."
-        )
+        raise HTTPException(status_code=400, detail="이미 등록된 이메일입니다.")
 
-    # 사용자 생성 (PENDING 상태)
     new_user = User(
         email=email,
         hashed_password=get_password_hash(password),
-        full_name=full_name,
-        role=UserRole.PENDING,
-        is_active=1
+        nickname=nickname,
+        role="BASIC",
+        is_active=1,
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
+    access_token = create_access_token(data={"sub": str(new_user.id)})
     return {
-        "message": "가입이 완료되었습니다. 관리자 승인 후 사용 가능합니다.",
+        "access_token": access_token,
+        "token_type": "bearer",
         "user": {
             "id": new_user.id,
             "email": new_user.email,
-            "role": new_user.role.value
-        }
+            "nickname": new_user.nickname,
+            "role": new_user.user_role.value,
+            "is_pro": False,
+        },
+        "message": "회원가입이 완료되었습니다.",
     }
 
 
-# ===== WebSocket API =====
-@app.websocket("/ws/chat/{token}")
-async def websocket_chat(
-    websocket: WebSocket,
-    token: str,
-    db: Session = Depends(get_db)
-):
-    """WebSocket 채팅"""
-    await handle_websocket(websocket, db, token)
+# ═══════════════════════════════════════════
+# 사용자 정보
+# ═══════════════════════════════════════════
+
+@app.get("/api/v2/me")
+async def get_me(current_user: User = Depends(get_current_active_user)):
+    """내 정보 조회"""
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "nickname": current_user.nickname or "",
+        "role": current_user.user_role.value,
+        "is_pro": current_user.user_role in (UserRole.PRO, UserRole.ADMIN),
+        "is_active": current_user.is_active == 1,
+        "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
+    }
 
 
-# ===== 대화 관리 API =====
-@app.get("/api/conversations")
+# ═══════════════════════════════════════════
+# 대화 & 메시지
+# ═══════════════════════════════════════════
+
+@app.get("/api/v2/conversations")
 async def get_conversations(
     current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """사용자의 대화 목록 가져오기"""
-    conversations = db.query(Conversation).filter(
+    convs = db.query(Conversation).filter(
         Conversation.user_id == current_user.id
     ).order_by(Conversation.updated_at.desc()).all()
-
     return {
         "conversations": [
             {
-                "id": conv.id,
-                "title": conv.title,
-                "created_at": conv.created_at.isoformat(),
-                "updated_at": conv.updated_at.isoformat()
+                "id": c.id,
+                "title": c.title,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "updated_at": c.updated_at.isoformat() if c.updated_at else None,
             }
-            for conv in conversations
+            for c in convs
         ]
     }
 
 
-@app.post("/api/conversations")
+@app.post("/api/v2/conversations")
 async def create_conversation(
+    request: Request,
     current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """새 대화 생성"""
-    new_conversation = Conversation(
-        user_id=current_user.id,
-        title="새로운 대화"
-    )
-    db.add(new_conversation)
+    try:
+        body = await request.json()
+        title = body.get("title", "새로운 대화")
+    except Exception:
+        title = "새로운 대화"
+
+    conv = Conversation(user_id=current_user.id, title=title)
+    db.add(conv)
     db.commit()
-    db.refresh(new_conversation)
-
-    return {
-        "conversation": {
-            "id": new_conversation.id,
-            "title": new_conversation.title,
-            "created_at": new_conversation.created_at.isoformat()
-        }
-    }
+    db.refresh(conv)
+    return {"conversation": {"id": conv.id, "title": conv.title, "created_at": conv.created_at.isoformat()}}
 
 
-# ===== 메시지 관리 API =====
-@app.get("/api/conversations/{conversation_id}/messages")
+@app.get("/api/v2/conversations/{conversation_id}/messages")
 async def get_messages(
     conversation_id: int,
     current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """대화의 메시지 목록 가져오기"""
-    # 대화 확인
-    conversation = db.query(Conversation).filter(
+    conv = db.query(Conversation).filter(
         Conversation.id == conversation_id,
-        Conversation.user_id == current_user.id
+        Conversation.user_id == current_user.id,
     ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
 
-    if not conversation:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="대화를 찾을 수 없습니다."
-        )
-
-    messages = db.query(Message).filter(
+    msgs = db.query(Message).filter(
         Message.conversation_id == conversation_id
     ).order_by(Message.created_at.asc()).all()
-
     return {
         "messages": [
-            {
-                "id": msg.id,
-                "role": msg.role,
-                "content": msg.content,
-                "created_at": msg.created_at.isoformat()
-            }
-            for msg in messages
+            {"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()}
+            for m in msgs
         ]
     }
+
+
+@app.post("/api/v2/conversations/{conversation_id}/messages")
+async def send_message(
+    conversation_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """메시지 전송 + Z.AI 응답"""
+    body = await request.json()
+    content = body.get("content", "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="메시지를 입력하세요.")
+
+    conv = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.user_id == current_user.id,
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
+
+    # 사용자 메시지 저장
+    user_msg = Message(conversation_id=conversation_id, user_id=current_user.id, role="user", content=content)
+    db.add(user_msg)
+    db.commit()
+    db.refresh(user_msg)
+
+    # Z.AI 응답 생성
+    ai_response = await _call_zai_chat(content)
+
+    # AI 메시지 저장
+    ai_msg = Message(conversation_id=conversation_id, user_id=current_user.id, role="assistant", content=ai_response)
+    db.add(ai_msg)
+    db.commit()
+    db.refresh(ai_msg)
+
+    return {
+        "user_message": {"id": user_msg.id, "role": "user", "content": content},
+        "ai_message": {"id": ai_msg.id, "role": "assistant", "content": ai_response},
+    }
+
+
+# ═══════════════════════════════════════════
+# Z.AI GLM 채팅
+# ═══════════════════════════════════════════
+
+async def _call_zai_chat(user_message: str, system_prompt: str = None) -> str:
+    """Z.AI GLM-4.5-air 호출 (채팅)"""
+    if not ZAI_API_KEY:
+        return "AI 서비스가 현재 비활성화 상태입니다. 잠시 후 다시 시도해주세요."
+
+    sys_msg = system_prompt or (
+        "당신은 AI 시그널톡의 트레이딩 어시스턴트입니다. "
+        "한국어로 친절하고 전문적으로 답변하세요. "
+        "주식, 선물, 원자재 시장에 대한 분석과 시그널을 제공합니다."
+    )
+
+    payload = {
+        "model": "glm-4.5-air",
+        "messages": [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1024,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{ZAI_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {ZAI_API_KEY}"},
+                json=payload,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                msg = data["choices"][0]["message"]
+                return msg.get("content") or msg.get("reasoning_content") or "응답을 생성할 수 없습니다."
+            else:
+                print(f"Z.AI 에러: {resp.status_code} {resp.text[:200]}")
+                return f"AI 응답 생성에 실패했습니다. (status: {resp.status_code})"
+    except httpx.TimeoutException:
+        return "AI 응답 시간이 초과되었습니다. 잠시 후 다시 시도해주세요."
+    except Exception as e:
+        print(f"Z.AI 호출 에러: {e}")
+        return "AI 서비스 연결에 실패했습니다."
+
+
+# ═══════════════════════════════════════════
+# AI 시그널 분석
+# ═══════════════════════════════════════════
+
+SYMBOL_MAP = {
+    "NQUSD": "나스닥 100 선물",
+    "GCUSD": "금 선물",
+    "CLUSD": "WTI 원유 선물",
+}
+
+@app.post("/api/v2/ai-signal")
+async def generate_signal(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Z.AI GLM-5 시그널 분석"""
+    body = await request.json()
+    symbol = body.get("symbol", "NQUSD")
+    timeframe = body.get("timeframe", "60min")
+
+    symbol_kr = SYMBOL_MAP.get(symbol, symbol)
+
+    # 예측 타입 결정
+    if timeframe in ("1min", "5min"):
+        prediction_type = "다음 봉 예측"
+    else:
+        prediction_type = "현재봉 마감 예측"
+
+    prompt = f"""{symbol_kr} {timeframe} 타임프레임 기술적 분석을 수행하세요.
+
+예측 타입: {prediction_type}
+현재 시각: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+
+다음 JSON 형식으로만 응답하세요 (다른 텍스트 없이):
+{{
+  "signal_type": "LONG" 또는 "SHORT",
+  "confidence": 1-100,
+  "entry_price": 숫자,
+  "target_price": 숫자,
+  "stop_loss": 숫자,
+  "risk_reward_ratio": 숫자,
+  "buy_probability": 1-100,
+  "sell_probability": 1-100,
+  "rationale": "분석 근거 (한국어 2-3문장)",
+  "prediction_type": "{prediction_type}"
+}}"""
+
+    payload = {
+        "model": "glm-5",
+        "messages": [
+            {"role": "system", "content": "You are a professional trading analyst. Respond ONLY with valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 800,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                f"{ZAI_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {ZAI_API_KEY}"},
+                json=payload,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                msg = data["choices"][0]["message"]
+                content = msg.get("content") or msg.get("reasoning_content") or "{}"
+            else:
+                content = "{}"
+    except Exception:
+        content = "{}"
+
+    # JSON 파싱 (코드블록 제거)
+    try:
+        cleaned = re.sub(r"```json\s*|\s*```", "", content).strip()
+        signal_data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        signal_data = {
+            "signal_type": "LONG",
+            "confidence": 50,
+            "entry_price": 0,
+            "target_price": 0,
+            "stop_loss": 0,
+            "risk_reward_ratio": 1.0,
+            "buy_probability": 50,
+            "sell_probability": 50,
+            "rationale": "분석 데이터를 불러오지 못했습니다.",
+            "prediction_type": prediction_type,
+        }
+
+    # SignalHistory 저장
+    history = SignalHistory(
+        user_id=current_user.id,
+        symbol=symbol,
+        timeframe=timeframe,
+        signal_type=signal_data.get("signal_type", "LONG"),
+        confidence=signal_data.get("confidence", 50),
+        entry_price=signal_data.get("entry_price", 0),
+        target_price=signal_data.get("target_price", 0),
+        stop_loss=signal_data.get("stop_loss", 0),
+        content=json.dumps(signal_data, ensure_ascii=False),
+    )
+    db.add(history)
+    db.commit()
+
+    return {**signal_data, "symbol": symbol, "timeframe": timeframe, "model": "glm-5"}
+
+
+@app.get("/api/v2/signals/history")
+async def get_signal_history(
+    symbol: Optional[str] = None,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """시그널 히스토리 조회"""
+    q = db.query(SignalHistory).filter(SignalHistory.user_id == current_user.id)
+    if symbol:
+        q = q.filter(SignalHistory.symbol == symbol)
+    histories = q.order_by(SignalHistory.created_at.desc()).limit(50).all()
+    return {
+        "history": [
+            {
+                "id": h.id,
+                "symbol": h.symbol,
+                "timeframe": h.timeframe,
+                "signal_type": h.signal_type,
+                "confidence": h.confidence,
+                "entry_price": h.entry_price,
+                "target_price": h.target_price,
+                "stop_loss": h.stop_loss,
+                "created_at": h.created_at.isoformat() if h.created_at else None,
+            }
+            for h in histories
+        ]
+    }
+
+
+# ═══════════════════════════════════════════
+# WebSocket 채팅
+# ═══════════════════════════════════════════
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[int, WebSocket] = {}
+
+    async def connect(self, user_id: int, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[user_id] = websocket
+
+    def disconnect(self, user_id: int):
+        self.active_connections.pop(user_id, None)
+
+    async def send_message(self, user_id: int, message: str):
+        ws = self.active_connections.get(user_id)
+        if ws:
+            await ws.send_text(message)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws/chat/{token}")
+async def websocket_chat(websocket: WebSocket, token: str):
+    payload = None
+    try:
+        from auth import decode_access_token
+        payload = decode_access_token(token)
+    except Exception:
+        await websocket.close(code=4001)
+        return
+
+    if not payload:
+        await websocket.close(code=4001)
+        return
+
+    user_id = int(payload.get("sub", 0))
+    await manager.connect(user_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # Z.AI 응답
+            ai_response = await _call_zai_chat(data)
+            await manager.send_message(user_id, json.dumps({
+                "type": "ai_response",
+                "content": ai_response,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }))
+    except WebSocketDisconnect:
+        manager.disconnect(user_id)
 
 
 if __name__ == "__main__":

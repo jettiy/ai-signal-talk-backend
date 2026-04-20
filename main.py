@@ -53,21 +53,8 @@ ZAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 @app.on_event("startup")
 async def startup_event():
     try:
-        # 강제 테이블 리셋 (기존 스키마와 충돌 방지)
-        print("DB 테이블 강제 리셋 중...")
-        with engine.connect() as conn:
-            # 모든 외래키 제약 먼저 삭제
-            for table in ["signal_histories", "messages", "conversations", "users"]:
-                try:
-                    conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
-                    print(f"  DROP {table}")
-                except Exception as e:
-                    print(f"  DROP {table} 스킵: {e}")
-            conn.commit()
-            print("테이블 삭제 완료")
-        
         Base.metadata.create_all(bind=engine)
-        print("테이블 생성 완료")
+        print("DB 테이블 확인 완료")
         
         db = SessionLocal()
         try:
@@ -204,55 +191,6 @@ async def v2_register(request: Request, db: Session = Depends(get_db)):
         },
         "message": "회원가입이 완료되었습니다.",
     }
-
-
-@app.post("/api/v2/auth/debug-register")
-async def debug_register(request: Request):
-    """디버그 — 회원가입 에러 원인 파악"""
-    import traceback
-    try:
-        body = await request.json()
-        email = body.get("email", "").strip()
-        password = body.get("password", "")
-        nickname = body.get("nickname", "").strip()
-
-        results = {"step": [], "error": None}
-
-        # 1. DB 연결
-        results["step"].append("1_db_connect")
-        db = SessionLocal()
-        results["step"].append("2_db_connected")
-
-        # 2. 쿼리 테스트
-        count = db.query(User).count()
-        results["step"].append(f"3_user_count={count}")
-
-        # 3. 비밀번호 해시
-        results["step"].append("4_hash_start")
-        hashed = get_password_hash(password)
-        results["step"].append(f"5_hash_done_len={len(hashed)}")
-
-        # 4. 사용자 생성
-        new_user = User(email=email, hashed_password=hashed, nickname=nickname, role="BASIC", is_active=1)
-        results["step"].append("6_user_created")
-
-        # 5. DB 추가
-        db.add(new_user)
-        results["step"].append("7_db_add")
-
-        # 6. 커밋
-        db.commit()
-        results["step"].append("8_db_commit")
-
-        db.refresh(new_user)
-        results["step"].append(f"9_refreshed_id={new_user.id}")
-
-        db.close()
-        results["step"].append("10_done")
-
-        return {"success": True, "steps": results["step"], "user_id": new_user.id}
-    except Exception as e:
-        return {"success": False, "error": str(e), "traceback": traceback.format_exc(), "steps": results.get("step", [])}
 
 
 # ═══════════════════════════════════════════

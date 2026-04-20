@@ -5,10 +5,11 @@ AI Signal Talk Backend v2.1 — 단일 파일 FastAPI 서버
 - 대화/메시지 관리
 - SignalHistory
 """
+import math
 import os
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
@@ -502,6 +503,84 @@ async def get_signal_history(
             }
             for h in histories
         ]
+    }
+
+
+# ═══════════════════════════════════════════
+# Admin API (ADMIN 권한 필수)
+# ═══════════════════════════════════════════
+
+async def require_admin(current_user: User = Depends(get_current_active_user)) -> User:
+    """ADMIN 권한 체크 dependency"""
+    if current_user.user_role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="관리자 권한이 필요합니다.")
+    return current_user
+
+
+@app.get("/api/v2/admin/users")
+async def admin_list_users(
+    page: int = 1,
+    limit: int = 20,
+    search: Optional[str] = None,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """사용자 목록 조회 (ADMIN 전용)"""
+    page = max(1, page)
+    limit = max(1, min(limit, 100))
+
+    q = db.query(User)
+    if search:
+        keyword = f"%{search}%"
+        q = q.filter(User.email.ilike(keyword) | User.nickname.ilike(keyword))
+
+    total = q.count()
+    users = q.order_by(User.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
+
+    return {
+        "users": [
+            {
+                "id": u.id,
+                "email": u.email,
+                "nickname": u.nickname or "",
+                "role": u.user_role.value,
+                "is_active": u.is_active == 1,
+                "created_at": u.created_at.isoformat() if u.created_at else None,
+            }
+            for u in users
+        ],
+        "total": total,
+        "page": page,
+        "totalPages": math.ceil(total / limit),
+    }
+
+
+@app.get("/api/v2/admin/stats")
+async def admin_stats(
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """플랫폼 통계 조회 (ADMIN 전용)"""
+    from sqlalchemy import func as sa_func
+
+    total_users = db.query(sa_func.count(User.id)).scalar()
+    pro_users = db.query(sa_func.count(User.id)).filter(User.role == "PRO").scalar()
+    basic_users = db.query(sa_func.count(User.id)).filter(User.role == "BASIC").scalar()
+
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_signups = db.query(sa_func.count(User.id)).filter(User.created_at >= today_start).scalar()
+
+    month_start = today_start - timedelta(days=30)
+    monthly_active = db.query(sa_func.count(sa_func.distinct(Message.user_id))).filter(
+        Message.created_at >= month_start
+    ).scalar()
+
+    return {
+        "total_users": total_users,
+        "pro_users": pro_users,
+        "basic_users": basic_users,
+        "today_signups": today_signups,
+        "monthly_active": monthly_active,
     }
 
 

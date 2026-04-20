@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends, H
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, cast, func, Date as SADate
 from database import engine, Base, get_db, SessionLocal
 from models import User, Conversation, Message, SignalHistory, UserRole
 from auth import (
@@ -636,6 +636,76 @@ async def websocket_chat(websocket: WebSocket, token: str):
             }))
     except WebSocketDisconnect:
         manager.disconnect(user_id)
+
+
+@app.get("/api/v2/admin/consultations")
+async def admin_consultations(
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """관리자 상담 목록 (ADMIN 전용)"""
+    from sqlalchemy.orm import joinedload
+    import sqlalchemy.orm as orm
+
+    convs = (
+        db.query(Conversation)
+        .options(orm.joinedload(Conversation.user))
+        .order_by(Conversation.updated_at.desc())
+        .limit(50)
+        .all()
+    )
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    pending_count = db.query(Conversation).filter(Conversation.created_at >= cutoff).count()
+
+    items = []
+    for c in convs:
+        msg_count = db.query(Message).filter(Message.conversation_id == c.id).count()
+        last_msg_obj = (
+            db.query(Message)
+            .filter(Message.conversation_id == c.id)
+            .order_by(Message.created_at.desc())
+            .first()
+        )
+        items.append({
+            "id": c.id,
+            "user_id": c.user_id,
+            "nickname": c.user.nickname if c.user else "알 수 없음",
+            "email": c.user.email if c.user else "",
+            "title": c.title or "",
+            "last_message": last_msg_obj.content[:80] if last_msg_obj else "",
+            "message_count": msg_count,
+            "status": "active",
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        })
+
+    return {"consultations": items, "pending_count": pending_count}
+
+
+@app.get("/api/v2/admin/daily-signups")
+async def admin_daily_signups(
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """최근 30일 일일 가입자 수 (ADMIN 전용)"""
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    rows = (
+        db.query(
+            cast(User.created_at, SADate).label('date'),
+            func.count(User.id).label('count'),
+        )
+        .filter(User.created_at >= thirty_days_ago)
+        .group_by(cast(User.created_at, SADate))
+        .order_by(cast(User.created_at, SADate))
+        .all()
+    )
+    return {
+        "daily": [
+            {"date": str(r.date), "count": r.count} for r in rows
+        ]
+    }
 
 
 if __name__ == "__main__":

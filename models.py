@@ -19,7 +19,6 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     nickname = Column(String, nullable=True)
-    phone = Column(String, nullable=True)
     role = Column(String, default="BASIC")  # PostgreSQL 호환: SQLEnum 대신 String
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

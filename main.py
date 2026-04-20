@@ -54,8 +54,16 @@ ZAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 async def startup_event():
     try:
         # 기존 테이블 DROP + 재생성 (스키마 마이그레이션)
-        Base.metadata.drop_all(bind=engine)
+        print("DB 테이블 리셋 중...")
+        from sqlalchemy import inspect
+        inspector = inspect(engine)
+        existing_tables = inspector.get_table_names()
+        if existing_tables:
+            print(f"기존 테이블: {existing_tables}")
+            Base.metadata.drop_all(bind=engine)
+            print("테이블 삭제 완료")
         Base.metadata.create_all(bind=engine)
+        print("테이블 생성 완료")
         
         db = SessionLocal()
         try:

@@ -53,10 +53,13 @@ ZAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 @app.on_event("startup")
 async def startup_event():
     try:
+        # 기존 테이블 DROP + 재생성 (스키마 마이그레이션)
+        Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
+        
         db = SessionLocal()
         try:
-            admin_email = os.environ.get("ADMIN_EMAIL", "admin@ai-signal-talk.com")
+            admin_email = os.environ.get("ADMIN_EMAIL", "admin@signaltalk.ai")
             admin = db.query(User).filter(User.email == admin_email).first()
             if not admin:
                 admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123!")

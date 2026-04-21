@@ -27,7 +27,6 @@ from auth import (
     get_current_user,
     get_current_active_user,
 )
-from routers.signal_rules import router as signal_rules_router
 
 # ─── FastAPI 앱 ───
 app = FastAPI(
@@ -35,7 +34,6 @@ app = FastAPI(
     description="트레이딩 커뮤니티 백엔드 API",
     version="2.1.0",
 )
-app.include_router(signal_rules_router)
 
 # ─── CORS ───
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ai-signal-talk.vercel.app")

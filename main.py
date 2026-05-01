@@ -82,6 +82,9 @@ async def startup_event():
         Base.metadata.create_all(bind=engine)
         print("DB 테이블 확인 완료")
 
+        # 기존 테이블에 새 컬럼 추가 (마이그레이션)
+        _migrate_db(engine)
+
         db = SessionLocal()
         try:
             # 관리자 계정 생성
@@ -121,6 +124,37 @@ async def startup_event():
             db.close()
     except Exception as e:
         print(f"Startup 경고: {e}")
+
+
+def _migrate_db(engine):
+    """기존 DB에 새 컬럼이 없으면 추가"""
+    from sqlalchemy import inspect, text as sa_text
+
+    inspector = inspect(engine)
+    
+    # messages 테이블 마이그레이션
+    if "messages" in inspector.get_table_names():
+        existing_cols = {col["name"] for col in inspector.get_columns("messages")}
+        
+        with engine.begin() as conn:
+            if "channel_id" not in existing_cols:
+                conn.execute(sa_text(
+                    "ALTER TABLE messages ADD COLUMN channel_id INTEGER REFERENCES channels(id)"
+                ))
+                print("[MIGRATE] Added channel_id to messages")
+            
+            if "is_bot" not in existing_cols:
+                conn.execute(sa_text(
+                    "ALTER TABLE messages ADD COLUMN is_bot BOOLEAN DEFAULT FALSE NOT NULL"
+                ))
+                print("[MIGRATE] Added is_bot to messages")
+            
+            # role 컬럼이 없으면 추가
+            if "role" not in existing_cols:
+                conn.execute(sa_text(
+                    "ALTER TABLE messages ADD COLUMN role VARCHAR"
+                ))
+                print("[MIGRATE] Added role to messages")
 
 
 # ─── Health ───

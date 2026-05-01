@@ -1,27 +1,35 @@
 import os
+
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# DATABASE_URL 환경변수를 1순위로 사용
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-if DATABASE_URL.startswith("postgresql"):
-    if "sslmode" not in DATABASE_URL:
-        separator = "&" if "?" in DATABASE_URL else "?"
-        DATABASE_URL += f"{separator}sslmode=require"
-elif not DATABASE_URL:
-    # 2순위: 개별 DB 환경변수 조합
-    DB_USER = os.environ.get("DB_USER", "")
-    DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
-    DB_HOST = os.environ.get("DB_HOST", "")
-    DB_PORT = os.environ.get("DB_PORT", "5432")
-    DB_NAME = os.environ.get("DB_NAME", "")
-    if DB_USER and DB_PASSWORD and DB_HOST:
-        DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode=require"
-    if DATABASE_URL.startswith("postgresql"):
-        if "sslmode" not in DATABASE_URL:
-            separator = "&" if "?" in DATABASE_URL else "?"
-            DATABASE_URL += f"{separator}sslmode=require"
+def _with_postgres_ssl(url: str) -> str:
+    if not url.startswith("postgresql") or "sslmode" in url:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}sslmode=require"
+
+
+def _database_url_from_env() -> str:
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if database_url:
+        return _with_postgres_ssl(database_url)
+
+    db_user = os.environ.get("DB_USER", "")
+    db_password = os.environ.get("DB_PASSWORD", "")
+    db_host = os.environ.get("DB_HOST", "")
+    db_port = os.environ.get("DB_PORT", "5432")
+    db_name = os.environ.get("DB_NAME", "")
+    if db_user and db_password and db_host and db_name:
+        return _with_postgres_ssl(
+            f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+        )
+
+    return "sqlite:///./ai_signal_talk.db"
+
+
+DATABASE_URL = _database_url_from_env()
 
 if DATABASE_URL.startswith("postgresql"):
     engine = create_engine(DATABASE_URL, pool_size=5, pool_recycle=300)

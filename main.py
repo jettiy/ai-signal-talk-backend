@@ -36,10 +36,24 @@ app = FastAPI(
 )
 
 # ─── CORS ───
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ai-signal-talk.vercel.app")
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://ai-signal-talk.vercel.app",
+    "https://signalchart.kr",
+    "https://www.signalchart.kr",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+
+def _allowed_origins() -> list[str]:
+    configured = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("FRONTEND_URL", "")
+    origins = [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
+    return list(dict.fromkeys(origins + DEFAULT_ALLOWED_ORIGINS))
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:3000"],
+    allow_origins=_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -590,19 +604,33 @@ async def admin_stats(
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: dict[int, WebSocket] = {}
+        self.active_connections: dict[int, set[WebSocket]] = {}
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[user_id] = websocket
+        self.active_connections.setdefault(user_id, set()).add(websocket)
 
-    def disconnect(self, user_id: int):
-        self.active_connections.pop(user_id, None)
+    def disconnect(self, user_id: int, websocket: WebSocket):
+        sockets = self.active_connections.get(user_id)
+        if not sockets:
+            return
+        sockets.discard(websocket)
+        if not sockets:
+            self.active_connections.pop(user_id, None)
 
-    async def send_message(self, user_id: int, message: str):
-        ws = self.active_connections.get(user_id)
-        if ws:
-            await ws.send_text(message)
+    async def send_message(self, user_id: int, message: dict):
+        stale: list[WebSocket] = []
+        for ws in self.active_connections.get(user_id, set()):
+            try:
+                await ws.send_text(json.dumps(message, ensure_ascii=False))
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            self.disconnect(user_id, ws)
+
+    async def broadcast(self, message: dict):
+        for user_id in list(self.active_connections.keys()):
+            await self.send_message(user_id, message)
 
 
 manager = ConnectionManager()
@@ -623,19 +651,82 @@ async def websocket_chat(websocket: WebSocket, token: str):
         return
 
     user_id = int(payload.get("sub", 0))
+    db = SessionLocal()
+    user = db.query(User).filter(User.id == user_id).first()
+    nickname = (user.nickname if user and user.nickname else None) or payload.get("email") or f"USER_{user_id}"
+
     await manager.connect(user_id, websocket)
+    await manager.broadcast({
+        "type": "presence",
+        "online_count": len(manager.active_connections),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
     try:
         while True:
-            data = await websocket.receive_text()
-            # Z.AI 응답
-            ai_response = await _call_zai_chat(data)
-            await manager.send_message(user_id, json.dumps({
-                "type": "ai_response",
-                "content": ai_response,
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {"type": "public_message", "content": raw}
+
+            msg_type = data.get("type", "public_message")
+            content = str(data.get("content", "")).strip()
+            if not content:
+                continue
+            if len(content) > 1000:
+                await manager.send_message(user_id, {
+                    "type": "error",
+                    "message": "메시지는 1000자 이하로 입력해주세요.",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                continue
+
+            is_ai_call = msg_type == "ai_private" or content.lower().startswith("@ai")
+            if is_ai_call:
+                query = re.sub(r"^@ai\s*", "", content, flags=re.IGNORECASE).strip()
+                if not query:
+                    await manager.send_message(user_id, {
+                        "type": "private_system",
+                        "content": "@AI 뒤에 질문을 입력해주세요.",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    continue
+
+                await manager.send_message(user_id, {
+                    "type": "private_user",
+                    "user_id": user_id,
+                    "nickname": nickname,
+                    "content": query,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                ai_response = await _call_zai_chat(query)
+                await manager.send_message(user_id, {
+                    "type": "private_ai",
+                    "content": ai_response,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                continue
+
+            await manager.broadcast({
+                "type": "public_message",
+                "user_id": user_id,
+                "nickname": nickname,
+                "content": content,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-            }))
+            })
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
+        manager.disconnect(user_id, websocket)
+    except Exception as exc:
+        print(f"WebSocket chat error: {exc}")
+        manager.disconnect(user_id, websocket)
+    finally:
+        db.close()
+        await manager.broadcast({
+            "type": "presence",
+            "online_count": len(manager.active_connections),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
 
 @app.get("/api/v2/admin/consultations")

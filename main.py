@@ -1,16 +1,18 @@
 """
-AI Signal Talk Backend v2.1 — 단일 파일 FastAPI 서버
+AI Signal Talk Backend v2.2 — FastAPI 서버
 - Auth: 로그인/회원가입 (JSON body)
-- Z.AI GLM 시그널 분석 연동
-- 대화/메시지 관리
-- SignalHistory
+- 시그널: 규칙엔진(수학적 계산) + LLM 자연어 설명
+- 채널 기반 실시간 채팅 (Global + 종목별)
+- 코스피 선물 추가
 """
 import math
 import os
 import json
 import re
+import asyncio
+import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Dict, List
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
@@ -19,7 +21,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from sqlalchemy import text, cast, func, Date as SADate
 from database import engine, Base, get_db, SessionLocal
-from models import User, Conversation, Message, SignalHistory, UserRole
+from models import User, Conversation, Message, SignalHistory, UserRole, Channel
 from auth import (
     get_password_hash,
     create_access_token,
@@ -32,7 +34,7 @@ from auth import (
 app = FastAPI(
     title="AI Signal Talk Backend",
     description="트레이딩 커뮤니티 백엔드 API",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 # ─── CORS ───
@@ -63,6 +65,15 @@ app.add_middleware(
 ZAI_API_KEY = os.environ.get("ZAI_API_KEY", "")
 ZAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 
+# ─── 심볼 매핑 (코스피 추가) ───
+SYMBOL_MAP = {
+    "NQUSD": "나스닥 100 선물",
+    "GCUSD": "금 선물",
+    "CLUSD": "WTI 원유 선물",
+    "HSIUSD": "항셍 선물",
+    "KSUSD": "코스피 선물",
+}
+
 
 # ─── Startup ───
 @app.on_event("startup")
@@ -70,9 +81,10 @@ async def startup_event():
     try:
         Base.metadata.create_all(bind=engine)
         print("DB 테이블 확인 완료")
-        
+
         db = SessionLocal()
         try:
+            # 관리자 계정 생성
             admin_email = os.environ.get("ADMIN_EMAIL", "admin@signaltalk.ai")
             admin = db.query(User).filter(User.email == admin_email).first()
             if not admin:
@@ -88,6 +100,23 @@ async def startup_event():
                 db.add(admin)
                 db.commit()
                 print(f"초기 관리자 계정 생성: {admin_email}")
+
+            # 기본 채널 생성
+            channels = [
+                {"name": "Global", "symbol": None},
+                {"name": "NASDAQ", "symbol": "NQUSD"},
+                {"name": "HSI", "symbol": "HSIUSD"},
+                {"name": "GOLD", "symbol": "GCUSD"},
+                {"name": "OIL", "symbol": "CLUSD"},
+                {"name": "KOSPI", "symbol": "KSUSD"},
+            ]
+            for ch_data in channels:
+                existing = db.query(Channel).filter(Channel.name == ch_data["name"]).first()
+                if not existing:
+                    channel = Channel(**ch_data)
+                    db.add(channel)
+            db.commit()
+            print("기본 채널 6개 확인 완료")
         finally:
             db.close()
     except Exception as e:
@@ -107,7 +136,7 @@ async def health_check():
         pass
     return {
         "status": "ok" if db_ok else "degraded",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "db": db_ok,
         "auth": True,
         "websocket": True,
@@ -116,7 +145,7 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    return {"message": "AI Signal Talk Backend API", "version": "2.1.0"}
+    return {"message": "AI Signal Talk Backend API", "version": "2.2.0"}
 
 
 # ═══════════════════════════════════════════
@@ -227,7 +256,104 @@ async def get_me(current_user: User = Depends(get_current_active_user)):
 
 
 # ═══════════════════════════════════════════
-# 대화 & 메시지
+# 채널 & 채팅 API
+# ═══════════════════════════════════════════
+
+@app.get("/api/v2/channels")
+async def get_channels(db: Session = Depends(get_db)):
+    """채널 목록 조회"""
+    channels = db.query(Channel).order_by(Channel.id).all()
+    return {
+        "channels": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "symbol": c.symbol,
+            }
+            for c in channels
+        ]
+    }
+
+
+@app.get("/api/v2/channels/{channel_id}/messages")
+async def get_channel_messages(
+    channel_id: int,
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """채널 메시지 목록 (최근 limit개)"""
+    channel = db.query(Channel).filter(Channel.id == channel_id).first()
+    if not channel:
+        raise HTTPException(status_code=404, detail="채널을 찾을 수 없습니다.")
+
+    messages = db.query(Message).filter(
+        Message.channel_id == channel_id
+    ).order_by(Message.created_at.desc()).limit(limit).all()
+
+    result = []
+    for msg in reversed(messages):
+        user = db.query(User).filter(User.id == msg.user_id).first() if msg.user_id else None
+        result.append({
+            "id": msg.id,
+            "channel_id": msg.channel_id,
+            "user_id": msg.user_id,
+            "nickname": user.nickname if user else None,
+            "content": msg.content,
+            "is_bot": msg.is_bot,
+            "user_role": user.role if user else None,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+        })
+
+    return result
+
+
+@app.post("/api/v2/channels/{channel_id}/messages")
+async def send_channel_message(
+    channel_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """채팅 메시지 전송 (REST)"""
+    channel = db.query(Channel).filter(Channel.id == channel_id).first()
+    if not channel:
+        raise HTTPException(status_code=404, detail="채널을 찾을 수 없습니다.")
+
+    body = await request.json()
+    content = body.get("content", "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="메시지를 입력하세요.")
+
+    # 이미지 업로드: Pro/Admin만
+    if content.startswith("data:image") or content.startswith("[IMAGE]:"):
+        if current_user.user_role not in (UserRole.PRO, UserRole.ADMIN):
+            raise HTTPException(status_code=403, detail="이미지 업로드는 PRO 또는 관리자만 가능합니다.")
+
+    message = Message(
+        channel_id=channel_id,
+        user_id=current_user.id,
+        content=content,
+        is_bot=False,
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+
+    return {
+        "id": message.id,
+        "channel_id": message.channel_id,
+        "user_id": message.user_id,
+        "nickname": current_user.nickname,
+        "content": message.content,
+        "is_bot": message.is_bot,
+        "user_role": current_user.user_role.value,
+        "created_at": message.created_at.isoformat() if message.created_at else None,
+    }
+
+
+# ═══════════════════════════════════════════
+# 대화 & 메시지 (AI 1:1 대화 - 기존 유지)
 # ═══════════════════════════════════════════
 
 @app.get("/api/v2/conversations")
@@ -314,16 +440,13 @@ async def send_message(
     if not conv:
         raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
 
-    # 사용자 메시지 저장
     user_msg = Message(conversation_id=conversation_id, user_id=current_user.id, role="user", content=content)
     db.add(user_msg)
     db.commit()
     db.refresh(user_msg)
 
-    # Z.AI 응답 생성
     ai_response = await _call_zai_chat(content)
 
-    # AI 메시지 저장
     ai_msg = Message(conversation_id=conversation_id, user_id=current_user.id, role="assistant", content=ai_response)
     db.add(ai_msg)
     db.commit()
@@ -382,14 +505,8 @@ async def _call_zai_chat(user_message: str, system_prompt: str = None) -> str:
 
 
 # ═══════════════════════════════════════════
-# AI 시그널 분석
+# AI 시그널 분석 (규칙엔진 + LLM 설명)
 # ═══════════════════════════════════════════
-
-SYMBOL_MAP = {
-    "NQUSD": "나스닥 100 선물",
-    "GCUSD": "금 선물",
-    "CLUSD": "WTI 원유 선물",
-}
 
 @app.post("/api/v2/ai-signal")
 async def generate_signal(
@@ -397,98 +514,62 @@ async def generate_signal(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
-    """Z.AI GLM-5 시그널 분석"""
+    """
+    시그널 분석:
+    1. yfinance에서 실제 차트 데이터 수집
+    2. 규칙엔진이 수학적으로 방향/확률/가격 결정
+    3. LLM이 트레이더 친화적 자연어로 설명 (지표명 노출 없이)
+    """
     body = await request.json()
     symbol = body.get("symbol", "NQUSD")
     timeframe = body.get("timeframe", "60min")
 
-    symbol_kr = SYMBOL_MAP.get(symbol, symbol)
-
-    # 예측 타입 결정
-    if timeframe in ("1min", "5min"):
-        prediction_type = "다음 봉 예측"
-    else:
-        prediction_type = "현재봉 마감 예측"
-
-    prompt = f"""{symbol_kr} {timeframe} 타임프레임 기술적 분석을 수행하세요.
-
-예측 타입: {prediction_type}
-현재 시각: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
-
-다음 JSON 형식으로만 응답하세요 (다른 텍스트 없이):
-{{
-  "signal_type": "LONG" 또는 "SHORT",
-  "confidence": 1-100,
-  "entry_price": 숫자,
-  "target_price": 숫자,
-  "stop_loss": 숫자,
-  "risk_reward_ratio": 숫자,
-  "buy_probability": 1-100,
-  "sell_probability": 1-100,
-  "rationale": "분석 근거 (한국어 2-3문장)",
-  "prediction_type": "{prediction_type}"
-}}"""
-
-    payload = {
-        "model": "glm-5",
-        "messages": [
-            {"role": "system", "content": "You are a professional trading analyst. Respond ONLY with valid JSON."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 800,
-    }
+    # PRO 권한 체크: 단기 타임프레임
+    short_timeframes = {"1min", "5min", "1", "5"}
+    if timeframe in short_timeframes and current_user.user_role not in (UserRole.PRO, UserRole.ADMIN):
+        raise HTTPException(
+            status_code=403,
+            detail="1분/5분 시그널은 PRO 전용입니다. PRO 업그레이드를 요청해주세요.",
+        )
 
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                f"{ZAI_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {ZAI_API_KEY}"},
-                json=payload,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                msg = data["choices"][0]["message"]
-                content = msg.get("content") or msg.get("reasoning_content") or "{}"
-            else:
-                content = "{}"
-    except Exception:
-        content = "{}"
-
-    # JSON 파싱 (코드블록 제거)
-    try:
-        cleaned = re.sub(r"```json\s*|\s*```", "", content).strip()
-        signal_data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        signal_data = {
-            "signal_type": "LONG",
-            "confidence": 50,
-            "entry_price": 0,
-            "target_price": 0,
-            "stop_loss": 0,
-            "risk_reward_ratio": 1.0,
-            "buy_probability": 50,
-            "sell_probability": 50,
-            "rationale": "분석 데이터를 불러오지 못했습니다.",
-            "prediction_type": prediction_type,
-        }
+        from services.signal_analysis_service import analyze_signal
+        result = await analyze_signal(symbol, timeframe)
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        print(f"[SIGNAL] 분석 에러: {e}")
+        raise HTTPException(status_code=500, detail="시그널 분석 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
 
     # SignalHistory 저장
     history = SignalHistory(
         user_id=current_user.id,
         symbol=symbol,
         timeframe=timeframe,
-        signal_type=signal_data.get("signal_type", "LONG"),
-        confidence=signal_data.get("confidence", 50),
-        entry_price=signal_data.get("entry_price", 0),
-        target_price=signal_data.get("target_price", 0),
-        stop_loss=signal_data.get("stop_loss", 0),
-        content=json.dumps(signal_data, ensure_ascii=False),
+        signal_type=result["direction"],
+        confidence=int(result["probability"]),
+        entry_price=result["entry_price"],
+        target_price=result["take_profit"],
+        stop_loss=result["stop_loss"],
+        content=json.dumps(result, ensure_ascii=False),
     )
     db.add(history)
     db.commit()
 
-    return {**signal_data, "symbol": symbol, "timeframe": timeframe, "model": "glm-5"}
+    return {
+        "signal_type": result["direction"],
+        "confidence": int(result["probability"]),
+        "entry_price": result["entry_price"],
+        "target_price": result["take_profit"],
+        "stop_loss": result["stop_loss"],
+        "risk_reward_ratio": result["risk_reward"],
+        "buy_probability": int(result["probability"]) if result["direction"] == "LONG" else 100 - int(result["probability"]),
+        "sell_probability": int(result["probability"]) if result["direction"] == "SHORT" else 100 - int(result["probability"]),
+        "rationale": result["rationale"],
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "model": "rule-engine + glm-4.5-air",
+    }
 
 
 @app.get("/api/v2/signals/history")
@@ -598,137 +679,6 @@ async def admin_stats(
     }
 
 
-# ═══════════════════════════════════════════
-# WebSocket 채팅
-# ═══════════════════════════════════════════
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[int, set[WebSocket]] = {}
-
-    async def connect(self, user_id: int, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.setdefault(user_id, set()).add(websocket)
-
-    def disconnect(self, user_id: int, websocket: WebSocket):
-        sockets = self.active_connections.get(user_id)
-        if not sockets:
-            return
-        sockets.discard(websocket)
-        if not sockets:
-            self.active_connections.pop(user_id, None)
-
-    async def send_message(self, user_id: int, message: dict):
-        stale: list[WebSocket] = []
-        for ws in self.active_connections.get(user_id, set()):
-            try:
-                await ws.send_text(json.dumps(message, ensure_ascii=False))
-            except Exception:
-                stale.append(ws)
-        for ws in stale:
-            self.disconnect(user_id, ws)
-
-    async def broadcast(self, message: dict):
-        for user_id in list(self.active_connections.keys()):
-            await self.send_message(user_id, message)
-
-
-manager = ConnectionManager()
-
-
-@app.websocket("/ws/chat/{token}")
-async def websocket_chat(websocket: WebSocket, token: str):
-    payload = None
-    try:
-        from auth import decode_access_token
-        payload = decode_access_token(token)
-    except Exception:
-        await websocket.close(code=4001)
-        return
-
-    if not payload:
-        await websocket.close(code=4001)
-        return
-
-    user_id = int(payload.get("sub", 0))
-    db = SessionLocal()
-    user = db.query(User).filter(User.id == user_id).first()
-    nickname = (user.nickname if user and user.nickname else None) or payload.get("email") or f"USER_{user_id}"
-
-    await manager.connect(user_id, websocket)
-    await manager.broadcast({
-        "type": "presence",
-        "online_count": len(manager.active_connections),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                data = {"type": "public_message", "content": raw}
-
-            msg_type = data.get("type", "public_message")
-            content = str(data.get("content", "")).strip()
-            if not content:
-                continue
-            if len(content) > 1000:
-                await manager.send_message(user_id, {
-                    "type": "error",
-                    "message": "메시지는 1000자 이하로 입력해주세요.",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                continue
-
-            is_ai_call = msg_type == "ai_private" or content.lower().startswith("@ai")
-            if is_ai_call:
-                query = re.sub(r"^@ai\s*", "", content, flags=re.IGNORECASE).strip()
-                if not query:
-                    await manager.send_message(user_id, {
-                        "type": "private_system",
-                        "content": "@AI 뒤에 질문을 입력해주세요.",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    continue
-
-                await manager.send_message(user_id, {
-                    "type": "private_user",
-                    "user_id": user_id,
-                    "nickname": nickname,
-                    "content": query,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                ai_response = await _call_zai_chat(query)
-                await manager.send_message(user_id, {
-                    "type": "private_ai",
-                    "content": ai_response,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                continue
-
-            await manager.broadcast({
-                "type": "public_message",
-                "user_id": user_id,
-                "nickname": nickname,
-                "content": content,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-    except WebSocketDisconnect:
-        manager.disconnect(user_id, websocket)
-    except Exception as exc:
-        print(f"WebSocket chat error: {exc}")
-        manager.disconnect(user_id, websocket)
-    finally:
-        db.close()
-        await manager.broadcast({
-            "type": "presence",
-            "online_count": len(manager.active_connections),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-
-
 @app.get("/api/v2/admin/consultations")
 async def admin_consultations(
     current_user: User = Depends(require_admin),
@@ -797,6 +747,201 @@ async def admin_daily_signups(
             {"date": str(r.date), "count": r.count} for r in rows
         ]
     }
+
+
+# ═══════════════════════════════════════════
+# WebSocket 채팅 (채널 기반)
+# ═══════════════════════════════════════════
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[int, List[WebSocket]] = {}  # channel_id -> [websockets]
+
+    async def connect(self, websocket: WebSocket, channel_id: int):
+        await websocket.accept()
+        if channel_id not in self.active_connections:
+            self.active_connections[channel_id] = []
+        self.active_connections[channel_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, channel_id: int):
+        if channel_id in self.active_connections:
+            try:
+                self.active_connections[channel_id].remove(websocket)
+            except ValueError:
+                pass
+
+    async def send_to_websocket(self, websocket: WebSocket, message: dict) -> bool:
+        try:
+            await websocket.send_json(message)
+            return True
+        except Exception:
+            return False
+
+    async def broadcast_to_channel(self, channel_id: int, message: dict):
+        if channel_id not in self.active_connections:
+            return
+        disconnected = []
+        for connection in list(self.active_connections[channel_id]):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                disconnected.append(connection)
+        for conn in disconnected:
+            self.disconnect(conn, channel_id)
+
+    async def broadcast_to_all(self, message: dict):
+        for cid in list(self.active_connections.keys()):
+            await self.broadcast_to_channel(cid, message)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws/chat/{channel_id}")
+async def websocket_chat(websocket: WebSocket, channel_id: int, token: str = None):
+    """채널 기반 WebSocket 채팅"""
+    db = SessionLocal()
+
+    # 채널 확인
+    channel = db.query(Channel).filter(Channel.id == channel_id).first()
+    if not channel:
+        await websocket.close(code=4004)
+        db.close()
+        return
+
+    # 인증
+    user = None
+    nickname = "익명"
+    if token:
+        try:
+            from auth import decode_access_token
+            payload = decode_access_token(token)
+            if payload:
+                user_id = int(payload.get("sub", 0))
+                user = db.query(User).filter(User.id == user_id).first()
+                if user:
+                    nickname = user.nickname or f"USER_{user_id}"
+        except Exception:
+            pass
+
+    if not user:
+        await websocket.close(code=4001)
+        db.close()
+        return
+
+    await manager.connect(websocket, channel_id)
+
+    # 입장 알림
+    await manager.broadcast_to_channel(channel_id, {
+        "type": "presence",
+        "channel_id": channel_id,
+        "online_count": len(manager.active_connections.get(channel_id, [])),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {"type": "message", "content": raw}
+
+            content = str(data.get("content", "")).strip()
+            if not content:
+                continue
+            if len(content) > 1000:
+                await manager.send_to_websocket(websocket, {
+                    "type": "error",
+                    "message": "메시지는 1000자 이하로 입력해주세요.",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                continue
+
+            # 이미지 업로드: Pro/Admin만
+            if content.startswith("data:image") or content.startswith("[IMAGE]:"):
+                if user.user_role not in (UserRole.PRO, UserRole.ADMIN):
+                    await manager.send_to_websocket(websocket, {
+                        "type": "error",
+                        "message": "이미지 업로드는 PRO 또는 관리자만 가능합니다.",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    continue
+
+            # AI 호출 (@ai 또는 @AI)
+            is_ai_call = content.lower().startswith("@ai")
+            if is_ai_call:
+                query = re.sub(r"^@ai\s*", "", content, flags=re.IGNORECASE).strip()
+                if not query:
+                    await manager.send_to_websocket(websocket, {
+                        "type": "private_system",
+                        "content": "@AI 뒤에 질문을 입력해주세요.",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    continue
+
+                # 사용자 질문 echo (본인만)
+                await manager.send_to_websocket(websocket, {
+                    "type": "private_user",
+                    "user_id": user.id,
+                    "nickname": nickname,
+                    "content": query,
+                    "is_private": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
+                # AI 응답 (본인만)
+                ai_response = await _call_zai_chat(query)
+                await manager.send_to_websocket(websocket, {
+                    "type": "private_ai",
+                    "content": ai_response,
+                    "is_private": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                continue
+
+            # 일반 채팅: DB 저장 + 채널 브로드캐스트
+            message = Message(
+                channel_id=channel_id,
+                user_id=user.id,
+                content=content,
+                is_bot=False,
+            )
+            try:
+                db.add(message)
+                db.commit()
+                db.refresh(message)
+                persisted = True
+            except Exception:
+                db.rollback()
+                persisted = False
+
+            await manager.broadcast_to_channel(channel_id, {
+                "type": "message",
+                "id": message.id if persisted else int(time.time() * 1000),
+                "channel_id": channel_id,
+                "user_id": user.id,
+                "nickname": nickname,
+                "content": content,
+                "is_bot": False,
+                "user_role": user.user_role.value,
+                "is_private": False,
+                "created_at": (message.created_at.isoformat() if persisted and message.created_at else datetime.now(timezone.utc).isoformat()),
+            })
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, channel_id)
+    except Exception as exc:
+        print(f"WebSocket chat error: {exc}")
+        manager.disconnect(websocket, channel_id)
+    finally:
+        db.close()
+        await manager.broadcast_to_channel(channel_id, {
+            "type": "presence",
+            "channel_id": channel_id,
+            "online_count": len(manager.active_connections.get(channel_id, [])),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
 
 if __name__ == "__main__":

@@ -236,6 +236,17 @@ async def v2_register(request: Request, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(status_code=400, detail="이미 등록된 이메일입니다.")
 
+    nick_taken = (
+        db.query(User)
+        .filter(
+            User.nickname.isnot(None),
+            func.lower(User.nickname) == nickname.lower(),
+        )
+        .first()
+    )
+    if nick_taken:
+        raise HTTPException(status_code=400, detail="이미 사용 중인 닉네임입니다.")
+
     new_user = User(email=email, hashed_password=get_password_hash(password), nickname=nickname, role="BASIC", is_active=1)
     db.add(new_user)
     db.commit()
@@ -247,6 +258,46 @@ async def v2_register(request: Request, db: Session = Depends(get_db)):
         "token_type": "bearer",
         "user": {"id": new_user.id, "email": new_user.email, "nickname": new_user.nickname, "role": new_user.user_role.value, "is_pro": False},
         "message": "회원가입이 완료되었습니다.",
+    }
+
+
+@app.get("/api/v2/auth/check-email")
+async def v2_check_email(
+    email: str = Query("", max_length=254),
+    db: Session = Depends(get_db),
+):
+    email = email.strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="이메일을 입력해주세요.")
+    if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email):
+        raise HTTPException(status_code=400, detail="올바른 이메일 형식을 입력해주세요.")
+    taken = db.query(User).filter(User.email == email).first() is not None
+    return {
+        "available": not taken,
+        "message": "이미 사용 중인 이메일입니다." if taken else "사용 가능한 아이디입니다.",
+    }
+
+
+@app.get("/api/v2/auth/check-nickname")
+async def v2_check_nickname(
+    nickname: str = Query("", max_length=64),
+    db: Session = Depends(get_db),
+):
+    nickname = nickname.strip()
+    if len(nickname) < 2:
+        raise HTTPException(status_code=400, detail="닉네임은 2자 이상 입력해주세요.")
+    taken = (
+        db.query(User)
+        .filter(
+            User.nickname.isnot(None),
+            func.lower(User.nickname) == nickname.lower(),
+        )
+        .first()
+        is not None
+    )
+    return {
+        "available": not taken,
+        "message": "이미 사용 중인 닉네임입니다." if taken else "사용 가능한 닉네임입니다.",
     }
 
 

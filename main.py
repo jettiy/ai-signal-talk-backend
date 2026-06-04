@@ -706,3 +706,70 @@ async def websocket_chat(websocket: WebSocket, channel_id: int, token: str = Que
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
+
+
+# ─── 실시간 시세 (yfinance) ──────────────────────────────────
+YFINANCE_SYMBOLS = {
+    "NQUSD": "NQ=F",     # 나스닥 100 선물
+    "GCUSD": "GCUSD",    # 금 선물 (FMP 실시간 우선, yfinance 폴백)
+    "CLUSD": "CL=F",     # WTI 원유 선물
+    "KSUSD": "^KS11",    # 코스피 (KRX 대기)
+}
+
+@app.get("/api/v2/quotes")
+async def get_realtime_quotes():
+    """yfinance 기반 실시간 선물 시세."""
+    import yfinance as yf
+    results = []
+    for symbol, yf_symbol in YFINANCE_SYMBOLS.items():
+        try:
+            ticker = yf.Ticker(yf_symbol)
+            info = ticker.fast_info
+            hist = ticker.history(period="2d")
+            if hist.empty:
+                continue
+            current = float(hist.iloc[-1]["Close"])
+            prev_close = float(hist.iloc[0]["Close"]) if len(hist) > 1 else current
+            change_pct = ((current - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+            results.append({
+                "symbol": symbol,
+                "price": round(current, 2),
+                "change": round(current - prev_close, 2),
+                "changePct": round(change_pct, 2),
+                "high": round(float(hist["High"].max()), 2),
+                "low": round(float(hist["Low"].min()), 2),
+                "volume": int(hist["Volume"].sum()) if "Volume" in hist.columns else 0,
+                "source": "yfinance",
+            })
+        except Exception as e:
+            print(f"[QUOTES] {symbol} 실패: {e}")
+    return results
+
+
+@app.get("/api/v2/quotes/{symbol}")
+async def get_realtime_quote(symbol: str):
+    """단일 종목 실시간 시세."""
+    import yfinance as yf
+    yf_symbol = YFINANCE_SYMBOLS.get(symbol)
+    if not yf_symbol:
+        return {"error": f"지원하지 않는 심볼: {symbol}"}
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        hist = ticker.history(period="2d")
+        if hist.empty:
+            return {"error": "데이터 없음"}
+        current = float(hist.iloc[-1]["Close"])
+        prev_close = float(hist.iloc[0]["Close"]) if len(hist) > 1 else current
+        change_pct = ((current - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+        return {
+            "symbol": symbol,
+            "price": round(current, 2),
+            "change": round(current - prev_close, 2),
+            "changePct": round(change_pct, 2),
+            "high": round(float(hist["High"].max()), 2),
+            "low": round(float(hist["Low"].min()), 2),
+            "volume": int(hist["Volume"].sum()) if "Volume" in hist.columns else 0,
+            "source": "yfinance",
+        }
+    except Exception as e:
+        return {"error": str(e)}

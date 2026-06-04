@@ -1,6 +1,6 @@
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
@@ -30,9 +30,19 @@ def _database_url_from_env() -> str:
 
 
 DATABASE_URL = _database_url_from_env()
+print(f"[DB] Connecting to: {DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else DATABASE_URL}")
 
 if DATABASE_URL.startswith("postgresql"):
-    engine = create_engine(DATABASE_URL, pool_size=5, pool_recycle=300)
+    try:
+        engine = create_engine(DATABASE_URL, pool_size=5, pool_recycle=300, pool_pre_ping=True)
+        # 연결 테스트
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("[DB] PostgreSQL 연결 성공!")
+    except Exception as e:
+        print(f"[DB] PostgreSQL 연결 실패: {e}")
+        print(f"[DB] SQLite로 폴백합니다.")
+        engine = create_engine("sqlite:///./ai_signal_talk.db", connect_args={"check_same_thread": False})
 else:
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 

@@ -708,68 +708,72 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
 
 
-# ─── 실시간 시세 (yfinance) ──────────────────────────────────
+# ─── 실시간 시세 (Yahoo Finance v8 API 직접) ────────────────────────
 YFINANCE_SYMBOLS = {
     "NQUSD": "NQ=F",     # 나스닥 100 선물
-    "GCUSD": "GCUSD",    # 금 선물 (FMP 실시간 우선, yfinance 폴백)
+    "GCUSD": "GC=F",     # 금 선물
     "CLUSD": "CL=F",     # WTI 원유 선물
-    "KSUSD": "^KS11",    # 코스피 (KRX 대기)
+    "KSUSD": "^KS11",    # 코스피
 }
+
+import httpx
+
+async def fetch_yahoo_quote(symbol: str, yahoo_symbol: str) -> dict | None:
+    """Yahoo Finance v8 API 직접 호출."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=2d&interval=1d"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                print(f"[QUOTES] Yahoo API {symbol}: status {resp.status_code}")
+                return None
+            data = resp.json()
+            result = data.get("chart", {}).get("result", [])
+            if not result:
+                return None
+            meta = result[0].get("meta", {})
+            price = meta.get("regularMarketPrice", 0)
+            prev = meta.get("chartPreviousClose", 0) or meta.get("previousClose", 0)
+            if not prev:
+                prev = price
+            change = round(price - prev, 2)
+            change_pct = round((change / prev) * 100, 2) if prev > 0 else 0.0
+            return {
+                "symbol": symbol,
+                "price": round(price, 2),
+                "change": change,
+                "changePct": change_pct,
+                "high": round(meta.get("regularMarketDayHigh", price), 2),
+                "low": round(meta.get("regularMarketDayLow", price), 2),
+                "volume": meta.get("regularMarketVolume", 0),
+                "source": "yahoo-finance",
+            }
+    except Exception as e:
+        print(f"[QUOTES] Yahoo API {symbol} 실패: {e}")
+        return None
+
 
 @app.get("/api/v2/quotes")
 async def get_realtime_quotes():
-    """yfinance 기반 실시간 선물 시세."""
-    import yfinance as yf
+    """Yahoo Finance 기반 실시간 선물 시세."""
     results = []
-    for symbol, yf_symbol in YFINANCE_SYMBOLS.items():
-        try:
-            ticker = yf.Ticker(yf_symbol)
-            info = ticker.fast_info
-            hist = ticker.history(period="2d")
-            if hist.empty:
-                continue
-            current = float(hist.iloc[-1]["Close"])
-            prev_close = float(hist.iloc[0]["Close"]) if len(hist) > 1 else current
-            change_pct = ((current - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
-            results.append({
-                "symbol": symbol,
-                "price": round(current, 2),
-                "change": round(current - prev_close, 2),
-                "changePct": round(change_pct, 2),
-                "high": round(float(hist["High"].max()), 2),
-                "low": round(float(hist["Low"].min()), 2),
-                "volume": int(hist["Volume"].sum()) if "Volume" in hist.columns else 0,
-                "source": "yfinance",
-            })
-        except Exception as e:
-            print(f"[QUOTES] {symbol} 실패: {e}")
+    for symbol, yahoo_symbol in YFINANCE_SYMBOLS.items():
+        quote = await fetch_yahoo_quote(symbol, yahoo_symbol)
+        if quote:
+            results.append(quote)
     return results
 
 
 @app.get("/api/v2/quotes/{symbol}")
 async def get_realtime_quote(symbol: str):
     """단일 종목 실시간 시세."""
-    import yfinance as yf
-    yf_symbol = YFINANCE_SYMBOLS.get(symbol)
-    if not yf_symbol:
+    yahoo_symbol = YFINANCE_SYMBOLS.get(symbol)
+    if not yahoo_symbol:
         return {"error": f"지원하지 않는 심볼: {symbol}"}
-    try:
-        ticker = yf.Ticker(yf_symbol)
-        hist = ticker.history(period="2d")
-        if hist.empty:
-            return {"error": "데이터 없음"}
-        current = float(hist.iloc[-1]["Close"])
-        prev_close = float(hist.iloc[0]["Close"]) if len(hist) > 1 else current
-        change_pct = ((current - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
-        return {
-            "symbol": symbol,
-            "price": round(current, 2),
-            "change": round(current - prev_close, 2),
-            "changePct": round(change_pct, 2),
-            "high": round(float(hist["High"].max()), 2),
-            "low": round(float(hist["Low"].min()), 2),
-            "volume": int(hist["Volume"].sum()) if "Volume" in hist.columns else 0,
-            "source": "yfinance",
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    quote = await fetch_yahoo_quote(symbol, yahoo_symbol)
+    if quote:
+        return quote
+    return {"error": "데이터 없음"}

@@ -353,9 +353,82 @@ async def get_chat_messages(
     return result
 
 
-# ═══════════════════════════════════════════
-# 대화 (AI 1:1)
-# ═══════════════════════════════════════════
+@app.post("/api/v2/chat/send")
+async def send_chat_message(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """일반 채팅 메시지 전송."""
+    body = await request.json()
+    content = str(body.get("content", "")).strip()
+    if not content or len(content) > 1000:
+        raise HTTPException(status_code=400, detail="메시지를 입력하세요.")
+
+    msg = Message(channel_id=GENERAL_CHANNEL_ID, user_id=current_user.id, content=content, is_bot=False)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    return {
+        "id": msg.id,
+        "user_id": msg.user_id,
+        "nickname": current_user.nickname,
+        "content": msg.content,
+        "is_bot": False,
+        "user_role": current_user.role,
+        "created_at": msg.created_at.isoformat() if msg.created_at else None,
+    }
+
+
+@app.post("/api/v2/chat/ai")
+async def send_ai_chat_message(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """AI 채팅 — 질문 + AI 응답을 채팅방에 저장."""
+    body = await request.json()
+    content = str(body.get("content", "")).strip()
+    if not content or len(content) > 1000:
+        raise HTTPException(status_code=400, detail="메시지를 입력하세요.")
+
+    # 사용자 메시지 저장
+    user_msg = Message(channel_id=GENERAL_CHANNEL_ID, user_id=current_user.id, content=content, is_bot=False)
+    db.add(user_msg)
+    db.commit()
+    db.refresh(user_msg)
+
+    # AI 응답
+    query = re.sub(r"^@ai\s*", "", content, flags=re.IGNORECASE).strip()
+    ai_response = await _call_zai_chat(query)
+
+    # AI 메시지 저장
+    ai_msg = Message(channel_id=GENERAL_CHANNEL_ID, user_id=None, content=ai_response, is_bot=True)
+    db.add(ai_msg)
+    db.commit()
+    db.refresh(ai_msg)
+
+    return {
+        "user_message": {
+            "id": user_msg.id,
+            "user_id": user_msg.user_id,
+            "nickname": current_user.nickname,
+            "content": user_msg.content,
+            "is_bot": False,
+            "user_role": current_user.role,
+            "created_at": user_msg.created_at.isoformat() if user_msg.created_at else None,
+        },
+        "ai_message": {
+            "id": ai_msg.id,
+            "user_id": None,
+            "nickname": "AI 어시스턴트",
+            "content": ai_msg.content,
+            "is_bot": True,
+            "user_role": "BOT",
+            "created_at": ai_msg.created_at.isoformat() if ai_msg.created_at else None,
+        },
+    }
 
 @app.get("/api/v2/conversations")
 async def get_conversations(current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):

@@ -15,7 +15,6 @@ def init_db():
         channels = [
             {"name": "Global", "symbol": None},
             {"name": "NASDAQ", "symbol": "NQUSD"},
-            {"name": "HSI", "symbol": "HSIUSD"},
             {"name": "GOLD", "symbol": "GCUSD"},
             {"name": "OIL", "symbol": "CLUSD"},
             {"name": "KOSPI", "symbol": "KSUSD"},
@@ -28,7 +27,7 @@ def init_db():
                 db.add(channel)
 
         db.commit()
-        print("Database initialized successfully - 6 channels created")
+        print("Database initialized successfully - 5 channels created")
     except Exception as e:
         print(f"Error initializing database: {e}")
         db.rollback()

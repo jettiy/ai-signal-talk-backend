@@ -19,7 +19,6 @@ def _load_api_config():
 
 SYMBOL_NAMES = {
     "NQ1!": "나스닥 선물", "NQUSD": "나스닥 선물",
-    "HSI1!": "항셍 선물", "HSIUSD": "항셍 선물",
     "GOLD": "금 선물", "GCUSD": "금 선물",
     "CL1!": "원유 선물", "CLUSD": "원유 선물",
     "KS1!": "코스피 선물", "KSUSD": "코스피 선물",

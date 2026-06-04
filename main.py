@@ -69,7 +69,6 @@ SYMBOL_MAP = {
     "NQUSD": "나스닥 100 선물",
     "GCUSD": "금 선물",
     "CLUSD": "WTI 원유 선물",
-    "HSIUSD": "항셍 선물",
     "KSUSD": "코스피 선물",
 }
 
@@ -144,7 +143,6 @@ async def startup_event():
             channels = [
                 {"name": "Global", "symbol": None},
                 {"name": "NASDAQ", "symbol": "NQUSD"},
-                {"name": "HSI", "symbol": "HSIUSD"},
                 {"name": "GOLD", "symbol": "GCUSD"},
                 {"name": "OIL", "symbol": "CLUSD"},
                 {"name": "KOSPI", "symbol": "KSUSD"},
@@ -153,7 +151,7 @@ async def startup_event():
                 if not db.query(Channel).filter(Channel.name == ch_data["name"]).first():
                     db.add(Channel(**ch_data))
             db.commit()
-            print("[STARTUP] 채널 6개 확인 완료")
+            print("[STARTUP] 채널 5개 확인 완료")
         finally:
             db.close()
     except Exception as e:

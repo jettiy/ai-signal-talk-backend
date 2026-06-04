@@ -18,10 +18,9 @@ _MIN_REQUEST_INTERVAL_SEC = 3.0
 # TradingView 심볼을 Yahoo Finance 심볼로 매핑 (코스피 추가)
 SYMBOL_MAPPING = {
     "NQ1!": "NQ=F",      # 나스닥 선물
-    "HSI1!": "HSI=F",    # 항셍 선물
     "GOLD": "GC=F",       # 골드 선물
     "CL1!": "CL=F",       # 원유 선물
-    "KS1!": "KS=F",       # 코스피 선물
+    "KS1!": "^KS11",     # 코스피 지수 (KRX API로 교체 예정)
 }
 
 # V2 프론트엔드 심볼 → 내부 심볼 매핑
@@ -30,7 +29,6 @@ V2_TO_INTERNAL = {
     "GCUSD": "GOLD",
     "CLUSD": "CL1!",
     "KSUSD": "KS1!",
-    "HSIUSD": "HSI1!",
 }
 
 # 타임프레임 매핑 (V2 프론트엔드 → yfinance interval)

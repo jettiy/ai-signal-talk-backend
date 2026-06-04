@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from sqlalchemy import text, cast, func, Date as SADate, inspect as sa_inspect
-from database import engine, Base, get_db, SessionLocal
+from database import engine, Base, get_db, SessionLocal, DATABASE_URL
 from models import User, Conversation, Message, SignalHistory, UserRole, Channel
 from auth import (
     get_password_hash,
@@ -164,14 +164,22 @@ async def startup_event():
 @app.get("/api/health")
 async def health_check():
     db_ok = False
+    db_error = None
+    db_url_display = DATABASE_URL.split('@')[1][:50] if '@' in DATABASE_URL else DATABASE_URL[:50]
     try:
         db = SessionLocal()
         db.execute(text("SELECT 1"))
         db.close()
         db_ok = True
-    except Exception:
-        pass
-    return {"status": "ok" if db_ok else "degraded", "version": "2.3.0", "db": db_ok}
+    except Exception as e:
+        db_error = str(e)[:200]
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "version": "2.3.0",
+        "db": db_ok,
+        "db_url": db_url_display,
+        "db_error": db_error,
+    }
 
 
 @app.get("/")

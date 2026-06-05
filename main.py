@@ -330,105 +330,33 @@ async def get_channels(db: Session = Depends(get_db)):
     return {"channels": [{"id": c.id, "name": c.name, "symbol": c.symbol} for c in channels]}
 
 
-@app.get("/api/v2/chat/messages")
-async def get_chat_messages(
+@app.get("/api/v2/channels/{channel_id}/messages")
+async def get_channel_messages(
+    channel_id: int,
     limit: int = 50,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
-    """단일 채팅방 메시지 조회."""
-    messages = db.query(Message).filter(Message.channel_id == GENERAL_CHANNEL_ID).order_by(Message.created_at.desc()).limit(limit).all()
+    messages = db.query(Message).filter(Message.channel_id == channel_id).order_by(Message.created_at.desc()).limit(limit).all()
     result = []
     for msg in reversed(messages):
         user = db.query(User).filter(User.id == msg.user_id).first() if msg.user_id else None
         result.append({
             "id": msg.id,
+            "channel_id": msg.channel_id,
             "user_id": msg.user_id,
-            "nickname": user.nickname if user else ("AI 어시스턴트" if msg.is_bot else None),
+            "nickname": user.nickname if user else None,
             "content": msg.content,
             "is_bot": msg.is_bot,
-            "user_role": user.role if user else ("BOT" if msg.is_bot else None),
+            "user_role": user.role if user else None,
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
         })
     return result
 
 
-@app.post("/api/v2/chat/send")
-async def send_chat_message(
-    request: Request,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db),
-):
-    """일반 채팅 메시지 전송."""
-    body = await request.json()
-    content = str(body.get("content", "")).strip()
-    if not content or len(content) > 1000:
-        raise HTTPException(status_code=400, detail="메시지를 입력하세요.")
-
-    msg = Message(channel_id=GENERAL_CHANNEL_ID, user_id=current_user.id, content=content, is_bot=False)
-    db.add(msg)
-    db.commit()
-    db.refresh(msg)
-
-    return {
-        "id": msg.id,
-        "user_id": msg.user_id,
-        "nickname": current_user.nickname,
-        "content": msg.content,
-        "is_bot": False,
-        "user_role": current_user.role,
-        "created_at": msg.created_at.isoformat() if msg.created_at else None,
-    }
-
-
-@app.post("/api/v2/chat/ai")
-async def send_ai_chat_message(
-    request: Request,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db),
-):
-    """AI 채팅 — 질문 + AI 응답을 채팅방에 저장."""
-    body = await request.json()
-    content = str(body.get("content", "")).strip()
-    if not content or len(content) > 1000:
-        raise HTTPException(status_code=400, detail="메시지를 입력하세요.")
-
-    # 사용자 메시지 저장
-    user_msg = Message(channel_id=GENERAL_CHANNEL_ID, user_id=current_user.id, content=content, is_bot=False)
-    db.add(user_msg)
-    db.commit()
-    db.refresh(user_msg)
-
-    # AI 응답
-    query = re.sub(r"^@ai\s*", "", content, flags=re.IGNORECASE).strip()
-    ai_response = await _call_zai_chat(query)
-
-    # AI 메시지 저장
-    ai_msg = Message(channel_id=GENERAL_CHANNEL_ID, user_id=None, content=ai_response, is_bot=True)
-    db.add(ai_msg)
-    db.commit()
-    db.refresh(ai_msg)
-
-    return {
-        "user_message": {
-            "id": user_msg.id,
-            "user_id": user_msg.user_id,
-            "nickname": current_user.nickname,
-            "content": user_msg.content,
-            "is_bot": False,
-            "user_role": current_user.role,
-            "created_at": user_msg.created_at.isoformat() if user_msg.created_at else None,
-        },
-        "ai_message": {
-            "id": ai_msg.id,
-            "user_id": None,
-            "nickname": "AI 어시스턴트",
-            "content": ai_msg.content,
-            "is_bot": True,
-            "user_role": "BOT",
-            "created_at": ai_msg.created_at.isoformat() if ai_msg.created_at else None,
-        },
-    }
+# ═══════════════════════════════════════════
+# 대화 (AI 1:1)
+# ═══════════════════════════════════════════
 
 @app.get("/api/v2/conversations")
 async def get_conversations(current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
@@ -624,22 +552,25 @@ async def admin_daily_signups(current_user: User = Depends(require_admin), db: S
 
 
 # ═══════════════════════════════════════════
-# WebSocket 채팅 (단일 오픈 채팅방)
+# WebSocket 채팅 (채널 기반)
 # ═══════════════════════════════════════════
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: Dict[int, List[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, channel_id: int):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections.setdefault(channel_id, []).append(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        try:
-            self.active_connections.remove(websocket)
-        except ValueError:
-            pass
+    def disconnect(self, websocket: WebSocket, channel_id: int):
+        if channel_id in self.active_connections:
+            try:
+                self.active_connections[channel_id].remove(websocket)
+            except ValueError:
+                pass
+            if not self.active_connections[channel_id]:
+                del self.active_connections[channel_id]
 
     async def send_personal(self, websocket: WebSocket, message: dict):
         try:
@@ -647,37 +578,33 @@ class ConnectionManager:
         except Exception:
             pass
 
-    async def broadcast(self, message: dict):
+    async def broadcast(self, channel_id: int, message: dict):
+        if channel_id not in self.active_connections:
+            return
         disconnected = []
-        for conn in list(self.active_connections):
+        for conn in list(self.active_connections[channel_id]):
             try:
                 await conn.send_json(message)
             except Exception:
                 disconnected.append(conn)
         for conn in disconnected:
-            self.disconnect(conn)
-
-    @property
-    def online_count(self) -> int:
-        return len(self.active_connections)
+            self.disconnect(conn, channel_id)
 
 
 manager = ConnectionManager()
 
-# 단일 채팅방 ID (고정)
-GENERAL_CHANNEL_ID = 1  # Global 채널을 메인 채팅방으로 사용
 
+@app.websocket("/ws/chat/{channel_id}")
+async def websocket_chat(websocket: WebSocket, channel_id: int, token: str = Query(None)):
+    """채널 기반 WebSocket 채팅 — /ws/chat/{channel_id}?token=xxx"""
 
-@app.websocket("/ws/chat")
-async def websocket_chat(websocket: WebSocket, token: str = Query(None)):
-    """단일 오픈 채팅방 WebSocket — /ws/chat?token=xxx"""
-
+    # 1) 인증 (token은 query param)
     user = None
     nickname = "익명"
-    user_role = "BASIC"
     db = SessionLocal()
 
     if not token:
+        # token이 없으면 연결 거부
         await websocket.close(code=4001)
         db.close()
         return
@@ -690,7 +617,6 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(None)):
             user = db.query(User).filter(User.id == user_id).first()
             if user:
                 nickname = user.nickname or f"USER_{user_id}"
-                user_role = user.user_role.value
     except Exception as e:
         print(f"[WS] Auth error: {e}")
 
@@ -699,15 +625,16 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(None)):
         db.close()
         return
 
-    await manager.connect(websocket)
+    # 2) 채널 확인 (없어도 연결은 허용 — 채널이 없으면 기본 채팅)
+    channel = db.query(Channel).filter(Channel.id == channel_id).first()
 
-    # 입장 알림
-    await manager.broadcast({
+    # 3) 연결 수락
+    await manager.connect(websocket, channel_id)
+
+    await manager.broadcast(channel_id, {
         "type": "presence",
-        "event": "join",
-        "user_id": user.id,
-        "nickname": nickname,
-        "online_count": manager.online_count,
+        "channel_id": channel_id,
+        "online_count": len(manager.active_connections.get(channel_id, [])),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -727,47 +654,17 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(None)):
             if content.lower().startswith("@ai"):
                 query = re.sub(r"^@ai\s*", "", content, flags=re.IGNORECASE).strip()
                 if not query:
-                    await manager.send_personal(websocket, {
-                        "type": "system",
-                        "content": "💡 @AI 뒤에 질문을 입력해주세요. 예: @AI 나스닥 전망은?",
-                    })
+                    await manager.send_personal(websocket, {"type": "private_system", "content": "@AI 뒤에 질문을 입력해주세요."})
                     continue
 
-                # AI 질문 브로드캐스트 (모두에게 보임)
-                await manager.broadcast({
-                    "type": "message",
-                    "id": int(time.time() * 1000),
-                    "user_id": user.id,
-                    "nickname": nickname,
-                    "content": content,
-                    "is_bot": False,
-                    "user_role": user_role,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                })
-
-                # AI 타이핑 표시
-                await manager.broadcast({
-                    "type": "typing",
-                    "nickname": "AI 어시스턴트",
-                })
-
+                await manager.send_personal(websocket, {"type": "private_user", "user_id": user.id, "nickname": nickname, "content": query, "is_private": True})
                 ai_response = await _call_zai_chat(query)
-
-                await manager.broadcast({
-                    "type": "message",
-                    "id": int(time.time() * 1000) + 1,
-                    "user_id": None,
-                    "nickname": "AI 어시스턴트",
-                    "content": ai_response,
-                    "is_bot": True,
-                    "user_role": "BOT",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                })
+                await manager.send_personal(websocket, {"type": "private_ai", "content": ai_response, "is_private": True})
                 continue
 
-            # 일반 채팅 — DB 저장
+            # 일반 채팅 — DB 저장 (실패해도 채팅은 계속)
             try:
-                msg = Message(channel_id=GENERAL_CHANNEL_ID, user_id=user.id, content=content, is_bot=False)
+                msg = Message(channel_id=channel_id, user_id=user.id, content=content, is_bot=False)
                 db.add(msg)
                 db.commit()
                 db.refresh(msg)
@@ -778,14 +675,17 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(None)):
                 msg_id = int(time.time() * 1000)
                 msg_time = datetime.now(timezone.utc).isoformat()
 
-            await manager.broadcast({
+            # 채널 브로드캐스트
+            await manager.broadcast(channel_id, {
                 "type": "message",
                 "id": msg_id,
+                "channel_id": channel_id,
                 "user_id": user.id,
                 "nickname": nickname,
                 "content": content,
                 "is_bot": False,
-                "user_role": user_role,
+                "user_role": user.user_role.value,
+                "is_private": False,
                 "created_at": msg_time,
             })
 
@@ -794,15 +694,12 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(None)):
     except Exception as exc:
         print(f"[WS] Error: {exc}")
     finally:
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, channel_id)
         db.close()
-        # 퇴장 알림
-        await manager.broadcast({
+        await manager.broadcast(channel_id, {
             "type": "presence",
-            "event": "leave",
-            "user_id": user.id if user else None,
-            "nickname": nickname,
-            "online_count": manager.online_count,
+            "channel_id": channel_id,
+            "online_count": len(manager.active_connections.get(channel_id, [])),
         })
 
 

@@ -8,7 +8,7 @@ from typing import Optional
 
 router = APIRouter()
 FMP_KEY = os.getenv("FMP_API_KEY", "")
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_BASE = "https://financialmodelingprep.com/stable"  # stable API 사용
 _CACHE, _TTL = {}, {}
 
 class Quote(BaseModel):
@@ -21,9 +21,12 @@ async def fetch(symbols: list[str]) -> list[Quote]:
         return _mock()
     try:
         async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.get(f"{FMP_BASE}/quote/{','.join(symbols)}", params={"apikey": FMP_KEY})
+            r = await c.get(f"{FMP_BASE}/quote?symbol={','.join(symbols)}&apikey={FMP_KEY}")
             r.raise_for_status()
-            return [Quote(**d, symbol=d["symbol"], change=float(d["change"]), changePct=float(d["changesPercentage"]), high52w=float(d["yearHigh"]), low52w=float(d["yearLow"]), volume=int(d["volume"]), marketCap=float(d.get("marketCap") or 0), pe=float(d.get("pe") or 0), exchange=d.get("exchange","NASDAQ")) for d in r.json()]
+            data = r.json()
+            if not data:
+                return _mock()
+            return [Quote(**d, symbol=d["symbol"], change=float(d.get("change", 0)), changePct=float(d.get("changesPercentage", 0)), high52w=float(d.get("yearHigh", 0)), low52w=float(d.get("yearLow", 0)), volume=int(d.get("volume", 0)), marketCap=float(d.get("marketCap", 0) or 0), pe=float(d.get("pe", 0) or 0), exchange=d.get("exchange", "NASDAQ")) for d in data]
     except:
         return _mock()
 

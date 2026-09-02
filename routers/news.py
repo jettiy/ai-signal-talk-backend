@@ -8,7 +8,7 @@ from typing import Optional
 
 router = APIRouter()
 FMP_KEY = os.getenv("FMP_API_KEY", "")
-FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
+FMP_BASE = "https://financialmodelingprep.com/stable"  # stable API 사용
 _CACHE, _TTL = {}, {}
 
 class NewsItem(BaseModel):
@@ -21,15 +21,25 @@ async def get_news(limit: int = Query(20)):
     if key in _CACHE and (time.time() - _TTL.get(key, 0)) < 30:
         return _CACHE[key]
     items = []
-    # FMP 뉴스
+    # FMP 뉴스 (stable API)
     if FMP_KEY:
         try:
             async with httpx.AsyncClient(timeout=10.0) as c:
-                r = await c.get(f"https://financialmodelingprep.com/api/v3/stock_news?limit={limit}&apikey={FMP_KEY}")
+                r = await c.get(f"{FMP_BASE}/news?limit={limit}&apikey={FMP_KEY}")
                 r.raise_for_status()
-                for d in r.json()[:limit]:
-                    items.append(NewsItem(**d))
-        except: pass
+                news_data = r.json()
+                if news_data:
+                    for d in news_data[:limit]:
+                        items.append(NewsItem(
+                            title=d.get("title", ""),
+                            text=d.get("text", d.get("description", "")),
+                            source=d.get("source", d.get("site", "Unknown")),
+                            publishedDate=d.get("publishedDate", new Date().isoformat()),
+                            url=d.get("url", "#"),
+                            symbol=d.get("symbol", "")
+                        ))
+        except:
+            pass
     # 모의 데이터 (없으면)
     if not items:
         items = [

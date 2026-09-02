@@ -1,7 +1,8 @@
-"""AI 시그널 생성 라우터 — MiMo / DeepSeek / GPT-4o 병렬 호출"""
+"""AI 시그널 생성 라우터 — Z.AI GLM-5 주력 + 기존 폴백"""
 import os
 import httpx
 import asyncio
+import json
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -9,6 +10,7 @@ import models, database, uuid
 
 router = APIRouter()
 
+ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
 MINIMAX_KEY = os.getenv("MINIMAX_API_KEY", "")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -44,7 +46,7 @@ def build_prompt(symbol: str, price: float, change_pct: float, news: list[dict])
     )
 
 
-async def call_ai(url: str, headers: dict, body: dict) -> dict | None:
+async def call_zai(url: str, headers: dict, body: dict) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.post(url, headers=headers, json=body)
@@ -81,30 +83,36 @@ async def generate_signal(body: SignalRequest, db: Session = Depends(database.ge
     prompt = build_prompt(body.symbol, body.price, body.changePct, body.news)
 
     tasks = []
+    # Z.AI GLM-5 주력
+    if ZAI_API_KEY:
+        tasks.append(call_zai(
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            {"Authorization": f"Bearer {ZAI_API_KEY}", "Content-Type": "application/json"},
+            {"model": "glm-5", "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "temperature": 0.7}
+        ))
     # MiniMax
     if MINIMAX_KEY:
-        tasks.append(call_ai(
+        tasks.append(call_zai(
             "https://api.minimax.chat/v1/text/chatcompletion_pro",
             {"Authorization": f"Bearer {MINIMAX_KEY}", "Content-Type": "application/json"},
             {"model": "MiniMax-Text-01", "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024}
         ))
     # DeepSeek
     if DEEPSEEK_KEY:
-        tasks.append(call_ai(
+        tasks.append(call_zai(
             "https://api.deepseek.com/v1/chat/completions",
             {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
             {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024}
         ))
     # OpenAI
     if OPENAI_KEY:
-        tasks.append(call_ai(
+        tasks.append(call_zai(
             "https://api.openai.com/v1/chat/completions",
             {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
             {"model": "gpt-4o", "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024}
         ))
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    model_names = ["MiniMax MiMo", "DeepSeek", "GPT-4o"]
+    model_names = ["Z.AI GLM-5", "MiniMax MiMo", "DeepSeek", "GPT-4o"]
     for i, r in enumerate(results):
         if isinstance(r, dict) and r.get("choices"):
             signal = parse_response(r, model_names[i])
